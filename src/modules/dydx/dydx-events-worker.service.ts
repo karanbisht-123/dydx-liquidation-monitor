@@ -6,7 +6,6 @@ import {
   Inject,
 } from '@nestjs/common';
 import Redis from 'ioredis';
-import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { INotificationsService } from '../notifications/notifications.interface';
 import {
@@ -31,6 +30,8 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DydxEventsWorkerService.name);
   private running = false;
   private abortController: AbortController | null = null;
+  private readonly fcmCache = new Map<string, { token: string | null; expiresAt: number }>();
+  private static readonly FCM_CACHE_TTL_MS = 60_000;
 
   constructor(
     @Inject('REDIS_CLIENT')
@@ -98,17 +99,20 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
         const stream = results[0] as unknown as [string, [string, Record<string, string>][]];
         const messages = stream[1];
 
+        const messageIds: string[] = [];
         for (const [messageId, fields] of messages) {
           try {
             const event = this.parseEvent(fields);
             await this.handleEvent(event);
-            await this.redis.xack(EVENT_STREAM_KEY, EVENT_CONSUMER_GROUP, messageId);
+            messageIds.push(messageId);
           } catch (err: unknown) {
             this.logger.error(
               `Failed to process event ${messageId}: ${(err as Error).message}`,
             );
-            // Don't ACK — it will be retried on next consumer start
           }
+        }
+        if (messageIds.length > 0) {
+          await this.redis.xack(EVENT_STREAM_KEY, EVENT_CONSUMER_GROUP, ...messageIds);
         }
       } catch (err: unknown) {
         if (!this.running) break;
@@ -213,7 +217,6 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
 
     const level = event.alertLevel;
 
-    // Dedup: skip if we already sent this warning recently
     const dedupKey = `dydx:alert:${event.address}:${event.subaccountNumber}:${event.marketId}:${level}`;
     try {
       const exists = await this.redis.get(dedupKey);
@@ -221,6 +224,7 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
       await this.redis.set(dedupKey, '1', 'EX', ALERT_DEDUP_TTL_SEC);
     } catch (err: unknown) {
       this.logger.warn(`Dedup check failed: ${(err as Error).message}`);
+      return;
     }
 
     this.logger.warn(
@@ -229,7 +233,6 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
       `liq=${event.liqPrice?.toFixed(2)} oracle=${event.oraclePrice.toFixed(2)}`,
     );
 
-    // 1. Send push notification
     try {
       const fcmToken = await this.getFcmToken(event.address);
       if (fcmToken) {
@@ -249,7 +252,6 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`Push notification failed: ${(err as Error).message}`);
     }
 
-    // 2. Persist alert log (async)
     void this.persistAlertLog(event, level);
   }
 
@@ -257,12 +259,19 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
    * Look up FCM token for a wallet address.
    */
   private async getFcmToken(address: string): Promise<string | null> {
+    const now = Date.now();
+    const cached = this.fcmCache.get(address);
+    if (cached && cached.expiresAt > now) {
+      return cached.token;
+    }
     try {
       const user = await this.prisma.user.findUnique({
         where: { walletAddress: address },
         select: { fcmToken: true },
       });
-      return user?.fcmToken ?? null;
+      const token = user?.fcmToken ?? null;
+      this.fcmCache.set(address, { token, expiresAt: now + DydxEventsWorkerService.FCM_CACHE_TTL_MS });
+      return token;
     } catch {
       return null;
     }
@@ -273,36 +282,6 @@ export class DydxEventsWorkerService implements OnModuleInit, OnModuleDestroy {
    */
   private async persistAlertLog(event: DydxEvent, alertType: string): Promise<void> {
     try {
-      // 1. Try the Prisma AlertLog model
-      const user = await this.prisma.user.findUnique({
-        where: { walletAddress: event.address },
-        select: { id: true },
-      });
-
-      if (user) {
-        const positionId = `${event.subaccountNumber}-${event.marketId}`;
-        try {
-          await this.prisma.alertLog.create({
-            data: {
-              userId: user.id,
-              positionId,
-              alertType: alertType as any,
-              distancePct: event.distancePct !== null
-                ? new Prisma.Decimal(event.distancePct.toFixed(4))
-                : new Prisma.Decimal(0),
-              oraclePrice: new Prisma.Decimal(event.oraclePrice.toFixed(10)),
-              liqPrice: event.liqPrice !== null
-                ? new Prisma.Decimal(event.liqPrice.toFixed(10))
-                : new Prisma.Decimal(0),
-            },
-          });
-        } catch (prismaErr: unknown) {
-          // Position may not exist in Prisma Position table (it's in raw SQL snapshot)
-          this.logger.debug(`Prisma alertLog create skipped: ${(prismaErr as Error).message}`);
-        }
-      }
-
-      // 2. Also write to raw SQL alert_log table (keeps compatibility with existing queries)
       await this.prisma.$executeRawUnsafe(
         `INSERT INTO alert_log
            (address, subaccount_number, market, level, liq_price, oracle_price, distance_pct, margin_type)

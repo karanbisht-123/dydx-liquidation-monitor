@@ -16,7 +16,6 @@ export interface UpsertPositionInput {
 
 export interface IPositionsService {
   upsertPosition(input: UpsertPositionInput): Promise<Position>;
-  createPosition(input: UpsertPositionInput): Promise<Position>;
   updatePosition(userId: string, positionId: string, input: Omit<UpsertPositionInput, 'userId' | 'positionId'>): Promise<Position>;
   markClosed(userId: string, positionId: string): Promise<Position>;
   getUserActivePositions(userId: string): Promise<Position[]>;

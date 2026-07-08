@@ -29,15 +29,14 @@ export class DydxCalculatorService {
     }
 
     let liq: number;
+    let mmrOther = 0;
 
     if (marginType === 'ISOLATED') {
       liq = (equity - s * p) / denom;
     } else {
-      // CROSS: subtract MMR of all OTHER positions in same subaccount
-      const mmrOther = allInSubaccount
+      mmrOther = allInSubaccount
         .filter((pos) => pos.market !== market)
         .reduce((sum, pos) => sum + Math.abs(pos.signedSize) * pos.oraclePrice * pos.mmf, 0);
-
       liq = (equity - s * p - mmrOther) / denom;
     }
 
@@ -46,14 +45,8 @@ export class DydxCalculatorService {
       return null;
     }
 
-    const mmrOtherValue = marginType === 'CROSS'
-      ? allInSubaccount
-          .filter((pos) => pos.market !== market)
-          .reduce((sum, pos) => sum + Math.abs(pos.signedSize) * pos.oraclePrice * pos.mmf, 0)
-      : 0;
-
     this.logger.debug(
-      `[${market}] liqPrice=${liq.toFixed(4)}, oracle=${oraclePrice}, side=${position.side}, equity=${equity.toFixed(4)}, mmrOther=${mmrOtherValue.toFixed(4)}`,
+      `[${market}] liqPrice=${liq.toFixed(4)}, oracle=${oraclePrice}, side=${position.side}, equity=${equity.toFixed(4)}, mmrOther=${mmrOther.toFixed(4)}`,
     );
     return liq;
   }

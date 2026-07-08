@@ -131,31 +131,6 @@ export class PositionsService implements IPositionsService {
     });
   }
 
-  async createPosition(input: UpsertPositionInput): Promise<Position> {
-    this.logger.debug(`Creating position for user ${input.userId}, positionId: ${input.positionId}`);
-    const sizeDecimal = new Prisma.Decimal(input.size.toString());
-    const entryPriceDecimal = new Prisma.Decimal(input.entryPrice.toString());
-    const liquidationPriceDecimal = new Prisma.Decimal(input.liquidationPrice.toString());
-    const oraclePriceDecimal = new Prisma.Decimal(input.oraclePrice.toString());
-    const marginDecimal = new Prisma.Decimal(input.margin.toString());
-
-    return this.prisma.position.create({
-      data: {
-        userId: input.userId,
-        positionId: input.positionId,
-        marketId: input.marketId,
-        subaccountNumber: input.subaccountNumber,
-        side: input.side,
-        size: sizeDecimal,
-        entryPrice: entryPriceDecimal,
-        liquidationPrice: liquidationPriceDecimal,
-        oraclePrice: oraclePriceDecimal,
-        margin: marginDecimal,
-        status: PositionStatus.OPEN,
-        lastCheckedAt: new Date(),
-      },
-    });
-  }
 
   async updatePosition(
     userId: string,

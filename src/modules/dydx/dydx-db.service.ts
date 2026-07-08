@@ -1,11 +1,13 @@
 import { Injectable, Logger, OnModuleInit, Inject } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import Redis from 'ioredis';
-import { DydxPosition, AlertLevel, WatchedAddress } from './dydx.types';
+import { DydxPosition, WatchedAddress } from './dydx.types';
 
 @Injectable()
 export class DydxDbService implements OnModuleInit {
   private readonly logger = new Logger(DydxDbService.name);
+  private watchedAddressesCache: { data: WatchedAddress[]; expiresAt: number } | null = null;
+  private static readonly WATCHED_CACHE_TTL_MS = 30_000;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -14,77 +16,29 @@ export class DydxDbService implements OnModuleInit {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    await this.createTablesIfNotExist();
     // Run cleanup on startup and schedule every 24 hours
     void this.cleanupOldLogs();
     setInterval(() => void this.cleanupOldLogs(), 24 * 60 * 60 * 1000);
   }
 
-  async createTablesIfNotExist(): Promise<void> {
-    try {
-      await this.prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS positions_snapshot (
-          id                SERIAL PRIMARY KEY,
-          address           TEXT NOT NULL,
-          subaccount_number INTEGER NOT NULL,
-          market            TEXT NOT NULL,
-          side              TEXT NOT NULL,
-          signed_size       NUMERIC NOT NULL,
-          entry_price       NUMERIC NOT NULL,
-          liq_price         NUMERIC,
-          oracle_price      NUMERIC,
-          distance_pct      NUMERIC,
-          margin_type       TEXT NOT NULL,
-          updated_at        TIMESTAMPTZ DEFAULT NOW(),
-          UNIQUE (address, subaccount_number, market)
-        );
-      `);
-
-      await this.prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS alert_log (
-          id                SERIAL PRIMARY KEY,
-          address           TEXT NOT NULL,
-          subaccount_number INTEGER NOT NULL,
-          market            TEXT NOT NULL,
-          level             TEXT NOT NULL,
-          liq_price         NUMERIC,
-          oracle_price      NUMERIC,
-          distance_pct      NUMERIC,
-          margin_type       TEXT NOT NULL,
-          fired_at          TIMESTAMPTZ DEFAULT NOW()
-        );
-      `);
-
-      await this.prisma.$executeRawUnsafe(`
-        CREATE INDEX IF NOT EXISTS idx_positions_address_market
-          ON positions_snapshot (address, market);
-      `);
-
-      await this.prisma.$executeRawUnsafe(`
-        CREATE INDEX IF NOT EXISTS idx_positions_address
-          ON positions_snapshot (address);
-      `);
-
-      await this.prisma.$executeRawUnsafe(`
-        CREATE INDEX IF NOT EXISTS idx_alert_log_address
-          ON alert_log (address, fired_at DESC);
-      `);
-
-      this.logger.log('dYdX snapshot tables ensured');
-    } catch (err: unknown) {
-      this.logger.error(`createTablesIfNotExist failed: ${(err as Error).message}`);
-    }
-  }
 
   async getWatchedAddresses(): Promise<WatchedAddress[]> {
+    const now = Date.now();
+    if (this.watchedAddressesCache && this.watchedAddressesCache.expiresAt > now) {
+      return this.watchedAddressesCache.data;
+    }
+
     const users = await this.prisma.user.findMany({
       where: { isActive: true, fcmToken: { not: null } },
       select: { walletAddress: true, fcmToken: true },
     });
 
-    return users
+    const data = users
       .filter((u): u is { walletAddress: string; fcmToken: string } => u.fcmToken !== null)
       .map((u) => ({ address: u.walletAddress, fcmToken: u.fcmToken }));
+
+    this.watchedAddressesCache = { data, expiresAt: now + DydxDbService.WATCHED_CACHE_TTL_MS };
+    return data;
   }
 
   upsertPositionSnapshot(position: DydxPosition): void {
@@ -122,62 +76,28 @@ export class DydxDbService implements OnModuleInit {
       });
   }
 
-  async logAlert(position: DydxPosition, level: AlertLevel): Promise<void> {
-    try {
-      await this.prisma.$executeRawUnsafe(
-        `INSERT INTO alert_log
-           (address, subaccount_number, market, level, liq_price, oracle_price, distance_pct, margin_type)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        position.address,
-        position.subaccountNumber,
-        position.market,
-        level,
-        position.liqPrice,
-        position.oraclePrice,
-        position.distancePct,
-        position.marginType,
-      );
-    } catch (err: unknown) {
-      this.logger.error(`logAlert failed [${position.market}]: ${(err as Error).message}`);
-    }
-  }
-
-  async cleanupOldLogs(): Promise<{ rawDeleted: number; prismaDeleted: number }> {
+  async cleanupOldLogs(): Promise<{ deleted: number }> {
     const daysRetention = parseInt(process.env.ALERT_LOG_RETENTION_DAYS || '30', 10);
     this.logger.log(`Starting database cleanup of alert logs older than ${daysRetention} days...`);
     try {
       const cutOffDate = new Date();
       cutOffDate.setDate(cutOffDate.getDate() - daysRetention);
 
-      // 1. Delete from raw SQL table `alert_log`
-      const rawRes = await this.prisma.$executeRawUnsafe(
+      const deleted = await this.prisma.$executeRawUnsafe(
         `DELETE FROM alert_log WHERE fired_at < $1`,
         cutOffDate,
       );
 
-      // 2. Delete from Prisma `AlertLog` table
-      const prismaRes = await this.prisma.alertLog.deleteMany({
-        where: {
-          sentAt: {
-            lt: cutOffDate,
-          },
-        },
-      });
-
-      this.logger.log(
-        `Cleanup complete: deleted ${rawRes} raw alert logs, ${prismaRes.count} Prisma alert logs`,
-      );
-      return { rawDeleted: rawRes, prismaDeleted: prismaRes.count };
+      this.logger.log(`Cleanup complete: deleted ${deleted} alert log rows`);
+      return { deleted };
     } catch (err: unknown) {
       this.logger.error(`Database cleanup failed: ${(err as Error).message}`);
-      return { rawDeleted: 0, prismaDeleted: 0 };
+      return { deleted: 0 };
     }
   }
 
   async deleteClosedPosition(address: string, subaccountNumber: number, market: string): Promise<void> {
-    this.logger.log(`Cleaning up closed position raw snapshot and alert logs: ${address} sub#${subaccountNumber} ${market}`);
     try {
-      // 1. Delete from positions_snapshot
       await this.prisma.$executeRawUnsafe(
         `DELETE FROM positions_snapshot WHERE address = $1 AND subaccount_number = $2 AND market = $3`,
         address,
@@ -185,7 +105,6 @@ export class DydxDbService implements OnModuleInit {
         market,
       );
 
-      // 2. Delete from raw alert_log
       await this.prisma.$executeRawUnsafe(
         `DELETE FROM alert_log WHERE address = $1 AND subaccount_number = $2 AND market = $3`,
         address,
@@ -193,7 +112,18 @@ export class DydxDbService implements OnModuleInit {
         market,
       );
 
-      // 3. Clear Redis dedup alert keys for this closed position immediately
+      const positionId = `${subaccountNumber}-${market}`;
+      const user = await this.prisma.user.findUnique({
+        where: { walletAddress: address },
+        select: { id: true },
+      });
+      if (user) {
+        await this.prisma.position.updateMany({
+          where: { userId: user.id, positionId, status: 'OPEN' },
+          data: { status: 'CLOSED' },
+        });
+      }
+
       try {
         await this.redis.del(
           `dydx:alert:${address}:${subaccountNumber}:${market}:WARNING`,
@@ -207,15 +137,17 @@ export class DydxDbService implements OnModuleInit {
     }
   }
 
-  async getSnapshotPositions(address: string): Promise<{ subaccountNumber: number; market: string }[]> {
+  async getSnapshotPositions(address: string): Promise<{ subaccountNumber: number; market: string; signed_size: number; entry_price: number }[]> {
     try {
-      const rows = await this.prisma.$queryRawUnsafe<{ subaccount_number: number; market: string }[]>(
-        `SELECT subaccount_number, market FROM positions_snapshot WHERE address = $1`,
+      const rows = await this.prisma.$queryRawUnsafe<{ subaccount_number: number; market: string; signed_size: string; entry_price: string }[]>(
+        `SELECT subaccount_number, market, signed_size, entry_price FROM positions_snapshot WHERE address = $1`,
         address,
       );
       return rows.map((r) => ({
         subaccountNumber: Number(r.subaccount_number),
         market: r.market,
+        signed_size: parseFloat(r.signed_size),
+        entry_price: parseFloat(r.entry_price),
       }));
     } catch (err: unknown) {
       this.logger.error(`getSnapshotPositions failed: ${(err as Error).message}`);

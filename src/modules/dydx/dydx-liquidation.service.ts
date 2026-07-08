@@ -211,24 +211,22 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
     // Get previous snapshot from DB
     const previousSnapshot = await this.db.getSnapshotPositions(address);
 
-    // Build a map of current positions keyed by subaccountNumber:marketId
     const currentMap = new Map<string, DydxPosition>();
     for (const pos of currentPositions) {
-      const key = `${pos.subaccountNumber}:${pos.market}`;
-      currentMap.set(key, pos);
+      currentMap.set(`${pos.subaccountNumber}:${pos.market}`, pos);
     }
 
-    // Build a set of previous snapshot keys
     const previousSet = new Set<string>();
+    const previousDetailMap = new Map<string, { signed_size: number; entry_price: number }>();
     for (const snap of previousSnapshot) {
-      previousSet.add(`${snap.subaccountNumber}:${snap.market}`);
+      const key = `${snap.subaccountNumber}:${snap.market}`;
+      previousSet.add(key);
+      previousDetailMap.set(key, { signed_size: snap.signed_size, entry_price: snap.entry_price });
     }
 
     const counts = { positions: currentPositions.length, newPos: 0, closed: 0, modified: 0, liquidations: 0 };
 
-    // ── Detect changes ──────────────────────────────────────────────────────
-
-    // 1. New positions (in current but not in previous)
+    // New positions
     for (const [key, pos] of currentMap) {
       if (!previousSet.has(key)) {
         counts.newPos++;
@@ -239,35 +237,32 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // 2. Closed positions (in previous but not in current)
+    // Closed positions
+    const closedCleanup: Promise<void>[] = [];
     for (const key of previousSet) {
       if (!currentMap.has(key)) {
         const [subNumStr, market] = key.split(':');
         const subNum = parseInt(subNumStr, 10);
         counts.closed++;
-        // Remove from sorted index
-        await this.liqIndex.remove(address, subNum, market);
-        // Clean up DB
-        await this.db.deleteClosedPosition(address, subNum, market);
-        // Emit event
-        await this.events.emitPositionClosed(address, subNum, market, 'LONG'); // side not known from snapshot key
+        closedCleanup.push(
+          this.liqIndex.remove(address, subNum, market),
+          this.db.deleteClosedPosition(address, subNum, market),
+          this.events.emitPositionClosed(address, subNum, market, 'LONG'),
+        );
       }
     }
+    await Promise.all(closedCleanup);
 
-    // 3. Modified positions (in both, check if size/entry changed)
-    const changedSubaccounts = new Set<string>();
+    //  Modified positions
     for (const [key, pos] of currentMap) {
-      if (!previousSet.has(key)) continue; // already handled as new
-
-      // Check if position data changed by comparing against stored snapshot
-      const snapshot = await this.db.getSnapshotPosition(address, pos.subaccountNumber, pos.market);
-      if (snapshot) {
-        const sizeChanged = snapshot.signed_size !== pos.signedSize;
-        const entryChanged = snapshot.entry_price !== pos.entryPrice;
+      if (!previousSet.has(key)) continue;
+      const snap = previousDetailMap.get(key);
+      if (snap) {
+        const sizeChanged = snap.signed_size !== pos.signedSize;
+        const entryChanged = snap.entry_price !== pos.entryPrice;
         if (sizeChanged || entryChanged) {
           counts.modified++;
           const subKey = `${address}:${pos.subaccountNumber}`;
-          changedSubaccounts.add(subKey);
           if (pos.marginType === 'CROSS') {
             dirtySubaccounts.add(subKey);
           }
@@ -275,54 +270,34 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // ── Enrich and update index ────────────────────────────────────────────
+    // Enrich and update index
 
-    // Group all current positions by subaccountNumber for enrichment
-    const groups = new Map<number, DydxPosition[]>();
-    for (const pos of currentPositions) {
-      const list = groups.get(pos.subaccountNumber) ?? [];
-      list.push(pos);
-      groups.set(pos.subaccountNumber, list);
-    }
-
-    // Enrich all positions (calculate liqPrice) — for CROSS margin, this
-    // automatically accounts for sibling positions because we pass the full group
     const enriched = this.calculator.enrichPositions(currentPositions);
 
-    for (const pos of enriched) {
-      if (pos.liqPrice !== null) {
-        // Always update the sorted set (even if unchanged, ZADD is idempotent and cheap)
-        await this.liqIndex.upsert(
-          pos.address,
-          pos.subaccountNumber,
-          pos.market,
-          pos.side,
-          pos.liqPrice,
-        );
-      }
+    await Promise.all(
+      enriched
+        .filter((pos) => pos.liqPrice !== null)
+        .map((pos) =>
+          this.liqIndex.upsert(pos.address, pos.subaccountNumber, pos.market, pos.side, pos.liqPrice!),
+        ),
+    );
 
-      // Upsert snapshot in DB
+    for (const pos of enriched) {
       this.db.upsertPositionSnapshot(pos);
     }
 
-    // ── Price tick liquidation check ──────────────────────────────────────
+    // Price tick liquidation check 
 
-    // Check each market for price movements that may have triggered liquidations
-    const marketsToCheck = new Set<string>();
-    for (const pos of enriched) {
-      marketsToCheck.add(pos.market);
-    }
-
-    for (const marketId of marketsToCheck) {
-      const liqs = await this.checkLiquidationsForMarket(marketId, marketParams);
-      counts.liquidations += liqs;
-    }
+    const marketsToCheck = [...new Set(enriched.map((p) => p.market))];
+    const liqCounts = await Promise.all(
+      marketsToCheck.map((marketId) => this.checkLiquidationsForMarket(marketId, marketParams)),
+    );
+    counts.liquidations = liqCounts.reduce((sum, n) => sum + n, 0);
 
     return counts;
   }
 
-  // ── Price Tick Liquidation Check ───────────────────────────────────────────
-  //
+  // Price Tick Liquidation Chec
   // For each market, compare previous price to current price and range-query
   // the sorted set to find ONLY the positions that were just liquidated.
   // This is O(log N + K) where K = number of liquidated positions, not O(N).
@@ -341,13 +316,11 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
 
     const prevPrice = await this.liqIndex.getLastPrice(marketId);
     if (prevPrice === null) {
-      // First time seeing this market — just store the price
       await this.liqIndex.setLastPrice(marketId, newPrice);
       return 0;
     }
 
     if (Math.abs(newPrice - prevPrice) < 0.001) {
-      // Price hasn't changed meaningfully
       return 0;
     }
 
@@ -410,91 +383,62 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
   //
   // Runs every WARNING_CHECK_INTERVAL_MS (30s). Queries the sorted set for
   // positions near their liquidation price. Emits warning events to the queue.
-  // Deduplication is handled by the event worker (DydxEventsWorkerService).
-  //
 
   private async runWarningCheck(): Promise<void> {
     try {
       const marketParams = await this.fetcher.getMarketParams();
-      let totalWarnings = 0;
 
-      for (const [marketId, market] of Object.entries(marketParams)) {
-        const oraclePrice = market.oraclePrice;
-        if (oraclePrice <= 0) continue;
+      // console.log(marketParams, "market parms ------")
 
-        // Check LONG warnings (within WARNING_THRESHOLD_PCT of liquidation)
-        const longWarnings = await this.liqIndex.findLongWarnings(
-          marketId,
-          oraclePrice,
-          WARNING_THRESHOLD_PCT,
-        );
+      const results = await Promise.all(
+        Object.entries(marketParams).map(async ([marketId, market]) => {
+          const oraclePrice = market.oraclePrice;
+          if (oraclePrice <= 0) return 0;
 
-        for (const entry of longWarnings) {
-          const parsed = DydxLiqIndexService.parseMember(entry.member);
-          if (!parsed) continue;
+          const [longWarnings, shortWarnings] = await Promise.all([
+            this.liqIndex.findLongWarnings(marketId, oraclePrice, WARNING_THRESHOLD_PCT),
+            this.liqIndex.findShortWarnings(marketId, oraclePrice, WARNING_THRESHOLD_PCT),
+          ]);
 
-          const distancePct = ((entry.liqPrice - oraclePrice) / oraclePrice) * 100;
-          const absDist = Math.abs(distancePct);
+          const classify = (entries: { member: string; liqPrice: number }[], side: 'LONG' | 'SHORT') => {
+            const tasks: Promise<void>[] = [];
+            for (const entry of entries) {
+              const parsed = DydxLiqIndexService.parseMember(entry.member);
+              if (!parsed) continue;
+              const distancePct = ((entry.liqPrice - oraclePrice) / oraclePrice) * 100;
 
-          let alertLevel: AlertLevel;
-          if (absDist <= CRITICAL_THRESHOLD_PCT) {
-            alertLevel = AlertLevel.CRITICAL;
-          } else if (absDist <= WARNING_THRESHOLD_PCT) {
-            alertLevel = AlertLevel.WARNING;
-          } else {
-            continue; // outside threshold, skip
-          }
+              // console.log(distancePct, "---- distancept--- ")
+              const absDist = Math.abs(distancePct);
+              let alertLevel: AlertLevel;
+              if (absDist <= CRITICAL_THRESHOLD_PCT) {
+                alertLevel = AlertLevel.CRITICAL;
+              } else if (absDist <= WARNING_THRESHOLD_PCT) {
+                alertLevel = AlertLevel.WARNING;
+              } else {
+                continue;
+              }
+              tasks.push(
+                this.events.emitWarning(
+                  parsed.address, parsed.subaccountNumber, parsed.marketId,
+                  side, entry.liqPrice, oraclePrice, distancePct, alertLevel,
+                ),
+              );
+            }
+            return tasks;
+          };
 
-          await this.events.emitWarning(
-            parsed.address,
-            parsed.subaccountNumber,
-            parsed.marketId,
-            'LONG',
-            entry.liqPrice,
-            oraclePrice,
-            distancePct,
-            alertLevel,
-          );
-          totalWarnings++;
-        }
+          // console.log(classify, "classify ---------")
 
-        // Check SHORT warnings (within WARNING_THRESHOLD_PCT of liquidation)
-        const shortWarnings = await this.liqIndex.findShortWarnings(
-          marketId,
-          oraclePrice,
-          WARNING_THRESHOLD_PCT,
-        );
+          const allTasks = [
+            ...classify(longWarnings, 'LONG'),
+            ...classify(shortWarnings, 'SHORT'),
+          ];
+          await Promise.all(allTasks);
+          return allTasks.length;
+        }),
+      );
 
-        for (const entry of shortWarnings) {
-          const parsed = DydxLiqIndexService.parseMember(entry.member);
-          if (!parsed) continue;
-
-          const distancePct = ((entry.liqPrice - oraclePrice) / oraclePrice) * 100;
-          const absDist = Math.abs(distancePct);
-
-          let alertLevel: AlertLevel;
-          if (absDist <= CRITICAL_THRESHOLD_PCT) {
-            alertLevel = AlertLevel.CRITICAL;
-          } else if (absDist <= WARNING_THRESHOLD_PCT) {
-            alertLevel = AlertLevel.WARNING;
-          } else {
-            continue;
-          }
-
-          await this.events.emitWarning(
-            parsed.address,
-            parsed.subaccountNumber,
-            parsed.marketId,
-            'SHORT',
-            entry.liqPrice,
-            oraclePrice,
-            distancePct,
-            alertLevel,
-          );
-          totalWarnings++;
-        }
-      }
-
+      const totalWarnings = results.reduce((sum, n) => sum + n, 0);
       if (totalWarnings > 0) {
         this.logger.log(`Warning check emitted ${totalWarnings} warning event(s)`);
       }
@@ -503,12 +447,6 @@ export class DydxLiquidationService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // ── Public: Rebuild the entire index from DB snapshots ──────────────────────
-
-  /**
-   * Rebuild the sorted-set index from scratch. Useful after Redis flush or
-   * first-time setup. Called manually via API or on startup if index is empty.
-   */
   async rebuildIndex(): Promise<void> {
     this.logger.log('Rebuilding liquidation index from DB snapshots...');
 
