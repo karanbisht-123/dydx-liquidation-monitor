@@ -23,6 +23,7 @@ model Position {
   userId             String
   positionId         String        // dYdX internal position id
   marketId           String        // e.g. BTC-USD
+  subaccountNumber   Int           @default(0) // dYdX subaccount number (0=CROSS, >=128=ISOLATED)
   side               PositionSide  // LONG or SHORT
   size               Decimal       @db.Decimal(30, 10)
   entryPrice         Decimal       @db.Decimal(30, 10)
@@ -37,6 +38,7 @@ model Position {
   alertLogs          AlertLog[]
 
   @@unique([userId, positionId])
+  @@index([marketId, liquidationPrice])
 }
 
 model AlertLog {

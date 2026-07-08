@@ -64,4 +64,25 @@ export class UsersService implements IUsersService {
       data: { fcmToken: null },
     });
   }
+
+  async getOrCreateUser(walletAddress: string): Promise<User> {
+    const normalizedWallet = walletAddress.toLowerCase();
+    this.logger.debug(`Getting or creating user with wallet: ${normalizedWallet}`);
+    
+    // Find first
+    const user = await this.prisma.user.findUnique({
+      where: { walletAddress: normalizedWallet },
+    });
+    if (user) {
+      return user;
+    }
+
+    // Create if not exists
+    return this.prisma.user.create({
+      data: {
+        walletAddress: normalizedWallet,
+        isActive: true,
+      },
+    });
+  }
 }

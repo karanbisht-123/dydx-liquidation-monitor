@@ -7,4 +7,5 @@ export interface IUsersService {
   getUserById(id: string): Promise<User | null>;
   getActiveUsers(): Promise<User[]>;
   clearFcmToken(userId: string): Promise<User>;
+  getOrCreateUser(walletAddress: string): Promise<User>;
 }

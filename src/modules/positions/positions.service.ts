@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { Position, PositionStatus, Prisma } from '@prisma/client';
 import { IPositionsService, UpsertPositionInput } from './positions.interface';
+import { Decimal } from 'decimal.js';
 
 @Injectable()
 export class PositionsService implements IPositionsService {
@@ -28,6 +29,7 @@ export class PositionsService implements IPositionsService {
         },
         update: {
           marketId: input.marketId,
+          subaccountNumber: input.subaccountNumber,
           side: input.side,
           size: sizeDecimal,
           entryPrice: entryPriceDecimal,
@@ -41,6 +43,7 @@ export class PositionsService implements IPositionsService {
           userId: input.userId,
           positionId: input.positionId,
           marketId: input.marketId,
+          subaccountNumber: input.subaccountNumber,
           side: input.side,
           size: sizeDecimal,
           entryPrice: entryPriceDecimal,
@@ -96,6 +99,7 @@ export class PositionsService implements IPositionsService {
         userId,
         positionId,
         marketId: '',
+        subaccountNumber: 0,
         side: 'LONG',
         size: new Prisma.Decimal(0),
         entryPrice: new Prisma.Decimal(0),
@@ -123,6 +127,82 @@ export class PositionsService implements IPositionsService {
     return this.prisma.position.findMany({
       where: {
         userId,
+      },
+    });
+  }
+
+  async createPosition(input: UpsertPositionInput): Promise<Position> {
+    this.logger.debug(`Creating position for user ${input.userId}, positionId: ${input.positionId}`);
+    const sizeDecimal = new Prisma.Decimal(input.size.toString());
+    const entryPriceDecimal = new Prisma.Decimal(input.entryPrice.toString());
+    const liquidationPriceDecimal = new Prisma.Decimal(input.liquidationPrice.toString());
+    const oraclePriceDecimal = new Prisma.Decimal(input.oraclePrice.toString());
+    const marginDecimal = new Prisma.Decimal(input.margin.toString());
+
+    return this.prisma.position.create({
+      data: {
+        userId: input.userId,
+        positionId: input.positionId,
+        marketId: input.marketId,
+        subaccountNumber: input.subaccountNumber,
+        side: input.side,
+        size: sizeDecimal,
+        entryPrice: entryPriceDecimal,
+        liquidationPrice: liquidationPriceDecimal,
+        oraclePrice: oraclePriceDecimal,
+        margin: marginDecimal,
+        status: PositionStatus.OPEN,
+        lastCheckedAt: new Date(),
+      },
+    });
+  }
+
+  async updatePosition(
+    userId: string,
+    positionId: string,
+    input: Omit<UpsertPositionInput, 'userId' | 'positionId'>,
+  ): Promise<Position> {
+    this.logger.debug(`Updating position for user ${userId}, positionId: ${positionId}`);
+    const sizeDecimal = new Prisma.Decimal(input.size.toString());
+    const entryPriceDecimal = new Prisma.Decimal(input.entryPrice.toString());
+    const liquidationPriceDecimal = new Prisma.Decimal(input.liquidationPrice.toString());
+    const oraclePriceDecimal = new Prisma.Decimal(input.oraclePrice.toString());
+    const marginDecimal = new Prisma.Decimal(input.margin.toString());
+
+    return this.prisma.position.update({
+      where: {
+        userId_positionId: {
+          userId,
+          positionId,
+        },
+      },
+      data: {
+        marketId: input.marketId,
+        subaccountNumber: input.subaccountNumber,
+        side: input.side,
+        size: sizeDecimal,
+        entryPrice: entryPriceDecimal,
+        liquidationPrice: liquidationPriceDecimal,
+        oraclePrice: oraclePriceDecimal,
+        margin: marginDecimal,
+        status: PositionStatus.OPEN,
+        lastCheckedAt: new Date(),
+      },
+    });
+  }
+
+  async updateOraclePrice(userId: string, positionId: string, oraclePrice: Decimal): Promise<Position> {
+    const oraclePriceDecimal = new Prisma.Decimal(oraclePrice.toString());
+    return this.prisma.position.update({
+      where: {
+        userId_positionId: {
+          userId,
+          positionId,
+        },
+      },
+      data: {
+        oraclePrice: oraclePriceDecimal,
+        lastCheckedAt: new Date(),
       },
     });
   }

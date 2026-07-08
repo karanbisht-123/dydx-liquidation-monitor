@@ -8,6 +8,8 @@ export interface PositionRiskInput {
   entryPrice: Decimal;
   margin: Decimal;
   side: 'LONG' | 'SHORT';
+  equity?: Decimal;
+  mmrOther?: Decimal;
 }
 
 export interface IRiskService {

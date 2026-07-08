@@ -1,6 +1,7 @@
 import * as admin from 'firebase-admin';
 import { Injectable, Logger, OnModuleInit, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import Redis from 'ioredis';
 import { INotificationsService, LiquidationAlertPayload } from './notifications.interface';
 import { IUsersService } from '../users/users.interface';
 
@@ -13,7 +14,9 @@ export class NotificationsService implements INotificationsService, OnModuleInit
     private readonly configService: ConfigService,
     @Inject('IUsersService')
     private readonly usersService: IUsersService,
-  ) {}
+    @Inject('REDIS_CLIENT')
+    private readonly redis: Redis,
+  ) { }
 
   onModuleInit(): void {
     const projectId = this.configService.get<string>('firebase.projectId');
@@ -39,7 +42,45 @@ export class NotificationsService implements INotificationsService, OnModuleInit
     }
   }
 
+  private getCooldownTtl(alertType: string): number {
+    switch (alertType) {
+      case 'CRITICAL':
+        return 3600;
+      case 'DANGER':
+        return 14400;
+      case 'WARNING':
+        return 43200;
+      default:
+        return 21600;
+    }
+  }
+
   async sendLiquidationAlert(fcmToken: string, payload: LiquidationAlertPayload): Promise<void> {
+    const isEnabled = this.configService.get<boolean>('notifications.enabled', true);
+    if (!isEnabled) {
+      return;
+    }
+
+    const user = await this.usersService.getUserById(payload.userId);
+    if (!user || !user.isActive) {
+      return;
+    }
+
+    if (payload.alertType === 'WARNING') {
+      const globalKey = `cooldown:notification:user-global:${payload.userId}`;
+      const globalSet = await this.redis.set(globalKey, '1', 'EX', 300, 'NX');
+      if (globalSet !== 'OK') {
+        return;
+      }
+    }
+
+    const cooldownKey = `cooldown:notification:${payload.userId}:${payload.positionId}:${payload.alertType}`;
+    const ttl = this.getCooldownTtl(payload.alertType);
+    const cooldownSet = await this.redis.set(cooldownKey, '1', 'EX', ttl, 'NX');
+    if (cooldownSet !== 'OK') {
+      return;
+    }
+
     const marginTypeText = payload.marginType || 'CROSS';
     const alertMessage = {
       title: `⚠️ Liquidation Risk [${marginTypeText}] — ${payload.marketId}`,
@@ -54,17 +95,6 @@ export class NotificationsService implements INotificationsService, OnModuleInit
         marginType: marginTypeText,
       }
     };
-
-    // Beautifully format and output the simulated push alert to the console
-    this.logger.warn(
-      `\n======================================================================\n` +
-      `📢 [SIMULATED PUSH NOTIFICATION SENT]\n` +
-      `To Token: ${fcmToken}\n` +
-      `Title:    ${alertMessage.title}\n` +
-      `Body:     ${alertMessage.body}\n` +
-      `Data:     ${JSON.stringify(alertMessage.data, null, 2)}\n` +
-      `======================================================================`
-    );
 
     if (!this.firebaseApp) {
       this.logger.warn('Skipping actual Firebase FCM transmission (Firebase Admin SDK not initialized).');
@@ -91,20 +121,21 @@ export class NotificationsService implements INotificationsService, OnModuleInit
       },
     };
 
-    try {
-      this.logger.log(`Sending push notification to Firebase FCM for user ${payload.userId}...`);
-      await admin.messaging().send(message);
-      this.logger.log(`Notification sent successfully via Firebase FCM to user ${payload.userId}`);
-    } catch (error: any) {
-      this.logger.error(`Firebase FCM error sending alert: ${error.message}`);
-      if (error.code === 'messaging/registration-token-not-registered') {
-        this.logger.warn(`FCM token expired for user ${payload.userId}. Clearing in DB.`);
-        try {
-          await this.usersService.clearFcmToken(payload.userId);
-        } catch (dbError: any) {
-          this.logger.error(`Failed to clear expired FCM token in DB for user ${payload.userId}: ${dbError.message}`);
+    this.logger.log(`Sending push notification to Firebase FCM for user ${payload.userId}...`);
+    admin.messaging().send(message)
+      .then(() => {
+        this.logger.log(`Notification sent successfully via Firebase FCM to user ${payload.userId}`);
+      })
+      .catch(async (error: any) => {
+        this.logger.error(`Firebase FCM error sending alert: ${error.message}`);
+        if (error.code === 'messaging/registration-token-not-registered') {
+          this.logger.warn(`FCM token expired for user ${payload.userId}. Clearing in DB.`);
+          try {
+            await this.usersService.clearFcmToken(payload.userId);
+          } catch (dbError: any) {
+            this.logger.error(`Failed to clear expired FCM token in DB for user ${payload.userId}: ${dbError.message}`);
+          }
         }
-      }
-    }
+      });
   }
 }

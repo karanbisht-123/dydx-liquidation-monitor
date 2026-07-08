@@ -61,6 +61,11 @@ export class DydxDbService implements OnModuleInit {
       `);
 
       await this.prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS idx_positions_address
+          ON positions_snapshot (address);
+      `);
+
+      await this.prisma.$executeRawUnsafe(`
         CREATE INDEX IF NOT EXISTS idx_alert_log_address
           ON alert_log (address, fired_at DESC);
       `);
@@ -194,8 +199,8 @@ export class DydxDbService implements OnModuleInit {
           `dydx:alert:${address}:${subaccountNumber}:${market}:WARNING`,
           `dydx:alert:${address}:${subaccountNumber}:${market}:CRITICAL`,
         );
-      } catch (redisErr: any) {
-        this.logger.warn(`Failed to delete Redis dedup keys for closed position: ${redisErr.message}`);
+      } catch (redisErr: unknown) {
+        this.logger.warn(`Failed to delete Redis dedup keys for closed position: ${(redisErr as Error).message}`);
       }
     } catch (err: unknown) {
       this.logger.error(`deleteClosedPosition failed: ${(err as Error).message}`);
@@ -204,7 +209,7 @@ export class DydxDbService implements OnModuleInit {
 
   async getSnapshotPositions(address: string): Promise<{ subaccountNumber: number; market: string }[]> {
     try {
-      const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      const rows = await this.prisma.$queryRawUnsafe<{ subaccount_number: number; market: string }[]>(
         `SELECT subaccount_number, market FROM positions_snapshot WHERE address = $1`,
         address,
       );
@@ -216,5 +221,75 @@ export class DydxDbService implements OnModuleInit {
       this.logger.error(`getSnapshotPositions failed: ${(err as Error).message}`);
       return [];
     }
+  }
+
+  /**
+   * Get a single position snapshot from the DB for change detection.
+   */
+  async getSnapshotPosition(
+    address: string,
+    subaccountNumber: number,
+    market: string,
+  ): Promise<{ signed_size: number; entry_price: number; side: string } | null> {
+    try {
+      const rows = await this.prisma.$queryRawUnsafe<{ signed_size: string; entry_price: string; side: string }[]>(
+        `SELECT signed_size, entry_price, side FROM positions_snapshot
+         WHERE address = $1 AND subaccount_number = $2 AND market = $3`,
+        address,
+        subaccountNumber,
+        market,
+      );
+      if (rows.length === 0) return null;
+      return {
+        signed_size: parseFloat(rows[0].signed_size),
+        entry_price: parseFloat(rows[0].entry_price),
+        side: rows[0].side,
+      };
+    } catch (err: unknown) {
+      this.logger.error(`getSnapshotPosition failed: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get ALL snapshots — used for rebuilding the sorted-set index from scratch.
+   */
+  async getAllSnapshots(): Promise<{
+    address: string;
+    subaccount_number: number;
+    market: string;
+    side: string;
+    liq_price: number | null;
+  }[]> {
+    try {
+      const rows = await this.prisma.$queryRawUnsafe<{
+        address: string;
+        subaccount_number: number;
+        market: string;
+        side: string;
+        liq_price: string | null;
+      }[]>(
+        `SELECT address, subaccount_number, market, side, liq_price FROM positions_snapshot`,
+      );
+      return rows.map((r) => ({
+        address: r.address,
+        subaccount_number: Number(r.subaccount_number),
+        market: r.market,
+        side: r.side,
+        liq_price: r.liq_price !== null ? parseFloat(r.liq_price) : null,
+      }));
+    } catch (err: unknown) {
+      this.logger.error(`getAllSnapshots failed: ${(err as Error).message}`);
+      return [];
+    }
+  }
+
+  async getLocalOpenPositions(address: string): Promise<any[]> {
+    return this.prisma.position.findMany({
+      where: {
+        user: { walletAddress: address },
+        status: 'OPEN',
+      },
+    });
   }
 }

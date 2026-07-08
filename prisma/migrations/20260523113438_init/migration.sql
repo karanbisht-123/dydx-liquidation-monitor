@@ -25,6 +25,7 @@ CREATE TABLE "Position" (
     "userId" TEXT NOT NULL,
     "positionId" TEXT NOT NULL,
     "marketId" TEXT NOT NULL,
+    "subaccountNumber" INTEGER NOT NULL DEFAULT 0,
     "side" "PositionSide" NOT NULL,
     "size" DECIMAL(30,10) NOT NULL,
     "entryPrice" DECIMAL(30,10) NOT NULL,
@@ -58,6 +59,9 @@ CREATE UNIQUE INDEX "User_walletAddress_key" ON "User"("walletAddress");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Position_userId_positionId_key" ON "Position"("userId", "positionId");
+
+-- CreateIndex
+CREATE INDEX "Position_marketId_liquidationPrice_idx" ON "Position"("marketId", "liquidationPrice");
 
 -- AddForeignKey
 ALTER TABLE "Position" ADD CONSTRAINT "Position_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

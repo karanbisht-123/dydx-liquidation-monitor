@@ -2,6 +2,7 @@ import { Controller, Post, Patch, Body, Param, NotFoundException, Inject } from 
 import { RegisterUserDto } from './dto/register-user.dto';
 import { UpdateTokenDto } from './dto/update-token.dto';
 import { IUsersService } from './users.interface';
+import { WalletAddressValidationPipe } from './pipes/wallet-address-validation.pipe';
 
 @Controller('users')
 export class UsersController {
@@ -22,7 +23,7 @@ export class UsersController {
 
   @Patch(':walletAddress/token')
   async updateToken(
-    @Param('walletAddress') walletAddress: string,
+    @Param('walletAddress', WalletAddressValidationPipe) walletAddress: string,
     @Body() dto: UpdateTokenDto,
   ): Promise<{ success: boolean }> {
     const user = await this.usersService.getUserByWallet(walletAddress);

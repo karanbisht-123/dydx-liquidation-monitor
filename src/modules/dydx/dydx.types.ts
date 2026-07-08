@@ -29,3 +29,30 @@ export interface WatchedAddress {
   address: string;
   fcmToken: string;
 }
+
+// ── Liquidation Index types ──────────────────────────────────────────────────
+
+export interface LiqIndexMember {
+  /** Redis sorted-set member, e.g. "0xABC:0:BTC-USD" */
+  key: string;
+  /** Liquidation price used as the sorted-set score */
+  score: number;
+}
+
+// ── Event types (Redis Streams) ───────────────────────────────────────────────
+
+export type DydxEventType = 'liquidation' | 'warning' | 'position_opened' | 'position_closed';
+
+export interface DydxEvent {
+  type: DydxEventType;
+  address: string;
+  subaccountNumber: number;
+  marketId: string;
+  side: 'LONG' | 'SHORT';
+  liqPrice: number | null;
+  oraclePrice: number;
+  distancePct: number | null;
+  alertLevel: AlertLevel | null;
+  equity: number | null;
+  timestamp: number;
+}

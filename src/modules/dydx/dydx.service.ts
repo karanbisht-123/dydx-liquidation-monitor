@@ -13,7 +13,7 @@ export class DydxService implements IDydxService, OnModuleInit {
     private readonly configService: ConfigService,
     @Inject('REDIS_CLIENT')
     private readonly redis: Redis,
-  ) {}
+  ) { }
 
   async onModuleInit(): Promise<void> {
     this.logger.log('dYdX Service initializing...');
@@ -57,13 +57,14 @@ export class DydxService implements IDydxService, OnModuleInit {
   async getMarkets(): Promise<any> {
     try {
       const cached = await this.redis.get(this.CACHE_KEY);
+
+      console.log(cached, "markets ---------")
       if (cached) {
         return JSON.parse(cached);
       }
       return await this.fetchMarketsAndCache();
     } catch (error: any) {
       this.logger.error(`Error retrieving cached markets: ${error.message}`);
-      // Fallback: try to fetch directly
       return await this.fetchMarketsAndCache();
     }
   }
@@ -85,7 +86,7 @@ export class DydxService implements IDydxService, OnModuleInit {
     const url = `${baseUrl}/v4/addresses/${walletAddress}`;
 
     this.logger.log(`Fetching positions for wallet: ${walletAddress} from ${url}`);
-    
+
     let subaccountsResponse: any;
     try {
       const response = await fetch(url);
@@ -137,7 +138,7 @@ export class DydxService implements IDydxService, OnModuleInit {
         const maintenanceMarginFraction = new Decimal(marketConfig.maintenanceMarginFraction || 0.05);
 
         // margin = netFunding + unrealizedPnl + (abs(size) * entryPrice / leverage)
-        // Note: size can be negative for SHORT positions, but we use the absolute value for financial leverage math.
+        // size can be negative for SHORT positions, but we use the absolute value for financial leverage math.
         const notionalValue = size.abs().mul(entryPrice);
         const positionMargin = netFunding.add(unrealizedPnl).add(
           notionalValue.div(leverage.isZero() ? new Decimal(1) : leverage)
@@ -146,7 +147,7 @@ export class DydxService implements IDydxService, OnModuleInit {
         const marginType = subaccount.subaccountNumber >= 128 ? 'ISOLATED' : 'CROSS';
 
         normalizedPositions.push({
-          positionId: `${subaccount.subaccountNumber}-${marketId}`, // Unique within this subaccount
+          positionId: `${subaccount.subaccountNumber}-${marketId}`,
           marketId,
           side: apiPos.side as 'LONG' | 'SHORT',
           size,
@@ -160,5 +161,42 @@ export class DydxService implements IDydxService, OnModuleInit {
     }
 
     return normalizedPositions;
+  }
+
+  async getParentSubaccount(
+    address: string,
+    subaccountNumber: number,
+  ): Promise<{ equity: Decimal; freeCollateral: Decimal; openPerpetualPositions?: any } | null> {
+    const baseUrl = this.configService.get<string>('dydx.indexerBaseUrl');
+    const url = `${baseUrl}/v4/addresses/${address}/subaccountNumber/${subaccountNumber}`;
+    this.logger.log(`Fetching subaccount details for ${address} sub#${subaccountNumber} from ${url}`);
+
+    try {
+      const response = await fetch(url);
+
+      console.log(response, "subaccount Equity")
+      if (response.status === 404) {
+        this.logger.warn(`Subaccount ${subaccountNumber} for address ${address} not found (404)`);
+        return null;
+      }
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json() as any;
+      this.logger.debug(`Raw subaccount response: ${JSON.stringify(data)}`);
+
+      const sub = data.subaccount || data;
+      const equityVal = sub.equity ?? 0;
+      const freeCollateralVal = sub.freeCollateral ?? sub.free_collateral ?? 0;
+
+      return {
+        equity: new Decimal(equityVal),
+        freeCollateral: new Decimal(freeCollateralVal),
+        openPerpetualPositions: sub.openPerpetualPositions || {},
+      };
+    } catch (error: any) {
+      this.logger.error(`Failed to fetch subaccount details: ${error.message}`);
+      return null;
+    }
   }
 }

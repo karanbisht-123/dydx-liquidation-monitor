@@ -9,7 +9,6 @@ import { PositionsModule } from './modules/positions/positions.module';
 import { DydxModule } from './modules/dydx/dydx.module';
 import { RiskModule } from './modules/risk/risk.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
-import { MonitorModule } from './modules/monitor/monitor.module';
 import { AppController } from './app.controller';
 
 @Module({
@@ -19,10 +18,7 @@ import { AppController } from './app.controller';
       load: [configuration],
     }),
     ThrottlerModule.forRoot([
-      {
-        ttl: 60000,
-        limit: 60,
-      },
+      { ttl: 60000, limit: 60 },
     ]),
     RedisModule,
     UsersModule,
@@ -30,7 +26,6 @@ import { AppController } from './app.controller';
     DydxModule,
     RiskModule,
     NotificationsModule,
-    MonitorModule,
   ],
   controllers: [AppController],
   providers: [

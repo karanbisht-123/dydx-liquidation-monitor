@@ -8,8 +8,10 @@ import { DydxCalculatorService } from './dydx-calculator.service';
 import { DydxAlertService } from './dydx-alert.service';
 import { DydxDbService } from './dydx-db.service';
 import { DydxLiquidationService } from './dydx-liquidation.service';
+import { DydxLiqIndexService } from './dydx-liq-index.service';
+import { DydxEventsService } from './dydx-events.service';
+import { DydxEventsWorkerService } from './dydx-events-worker.service';
 
-// Keep the old DydxService for backward compatibility with MonitorModule
 import { DydxService } from './dydx.service';
 
 @Module({
@@ -21,7 +23,9 @@ import { DydxService } from './dydx.service';
     DydxAlertService,
     DydxDbService,
     DydxLiquidationService,
-    // Legacy provider for MonitorModule injection token
+    DydxLiqIndexService,
+    DydxEventsService,
+    DydxEventsWorkerService,
     {
       provide: 'IDydxService',
       useClass: DydxService,
@@ -34,6 +38,8 @@ import { DydxService } from './dydx.service';
     DydxAlertService,
     DydxDbService,
     DydxLiquidationService,
+    DydxLiqIndexService,
+    DydxEventsService,
   ],
 })
-export class DydxModule {}
+export class DydxModule { }

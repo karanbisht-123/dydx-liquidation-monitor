@@ -1,17 +1,27 @@
 import { Controller, Get } from '@nestjs/common';
-import { MonitorScheduler } from './modules/monitor/monitor.scheduler';
+import { Inject } from '@nestjs/common';
+import Redis from 'ioredis';
 
 @Controller('health')
 export class AppController {
-  constructor(private readonly monitorScheduler: MonitorScheduler) {}
+  constructor(
+    @Inject('REDIS_CLIENT')
+    private readonly redis: Redis,
+  ) {}
 
   @Get()
-  async getHealth(): Promise<{ status: string; timestamp: string; queueDepth: number }> {
-    const queueDepth = await this.monitorScheduler.getQueueDepth();
+  async getHealth(): Promise<{ status: string; timestamp: string; redis: string }> {
+    let redisStatus = 'down';
+    try {
+      await this.redis.ping();
+      redisStatus = 'ok';
+    } catch {
+      redisStatus = 'down';
+    }
     return {
       status: 'ok',
       timestamp: new Date().toISOString(),
-      queueDepth,
+      redis: redisStatus,
     };
   }
 }

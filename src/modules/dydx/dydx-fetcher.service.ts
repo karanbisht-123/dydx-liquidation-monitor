@@ -203,4 +203,31 @@ export class DydxFetcherService {
       }
     }
   }
+
+  async getSubaccountEquities(address: string): Promise<Record<number, number>> {
+    const url = `${DYDX_BASE_URL}/addresses/${address}`;
+    try {
+      const data = await this.httpGet<any>(url);
+      const equities: Record<number, number> = {};
+      for (const sub of data.subaccounts ?? []) {
+        equities[sub.subaccountNumber] = parseFloat(sub.equity || '0');
+      }
+      return equities;
+    } catch {
+      return {};
+    }
+  }
+
+  async getSubaccount(address: string, subaccountNumber: number): Promise<{ equity: number } | null> {
+    const url = `${DYDX_BASE_URL}/addresses/${address}/subaccounts/${subaccountNumber}`;
+    try {
+      const data = await this.httpGet<any>(url);
+      const sub = data.subaccount || data;
+      return {
+        equity: parseFloat(sub.equity || '0'),
+      };
+    } catch {
+      return null;
+    }
+  }
 }

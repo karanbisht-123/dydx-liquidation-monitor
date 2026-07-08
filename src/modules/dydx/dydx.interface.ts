@@ -15,4 +15,6 @@ export interface NormalizedPosition {
 export interface IDydxService {
   getPositions(walletAddress: string): Promise<NormalizedPosition[]>;
   getMarketData(marketId: string): Promise<{ oraclePrice: Decimal; maintenanceMarginFraction: Decimal } | null>;
+  getMarkets(): Promise<any>;
+  getParentSubaccount(address: string, subaccountNumber: number): Promise<{ equity: Decimal; freeCollateral: Decimal; openPerpetualPositions?: any } | null>;
 }

@@ -10,20 +10,85 @@ export class RiskService implements IRiskService {
   calculateLiquidationPrice(position: PositionRiskInput): Decimal {
     const { size, oraclePrice, maintenanceMarginFraction, entryPrice, margin, side } = position;
 
+    // MMR = Size * OraclePrice * MMF
     const mmr = size.mul(oraclePrice).mul(maintenanceMarginFraction);
 
     if (size.isZero()) {
       return entryPrice;
     }
 
-    const marginDiff = margin.sub(mmr);
-    const quotient = marginDiff.div(size);
-
     let liquidationPrice: Decimal;
-    if (side === 'LONG') {
-      liquidationPrice = entryPrice.sub(quotient);
+
+    if (position.equity) {
+      /**
+       * Official dYdX v4 Liquidation Formula for Subaccount:
+       *
+       * Liquidation happens when:
+       *   Account Equity < Total Subaccount Maintenance Margin Requirement (MMR)
+       *
+       * Let s = signed position size (+ for LONG, - for SHORT)
+       * Let abs(s) = absolute size
+       * Let p = entry price
+       * Let p' = liquidation price
+       * Let e = account equity at entry
+       * Let MMF = maintenance margin fraction
+       * Let MMR_other = sum of MMRs of all other positions in same subaccount (for CROSS margin)
+       *
+       * At the point of liquidation:
+       *   Equity_liq = e + s * (p' - p)
+       *   MMR_total_liq = abs(s) * p' * MMF + MMR_other
+       *
+       * Setting them equal:
+       *   e + s * p' - s * p = abs(s) * p' * MMF + MMR_other
+       *   p' * (abs(s) * MMF - s) = e - s * p - MMR_other
+       *   p' = (e - s * p - MMR_other) / (abs(s) * MMF - s)
+       */
+      const s = side === 'LONG' ? size : size.negated();
+      const absS = size.abs();
+      const denom = absS.mul(maintenanceMarginFraction).sub(s);
+
+      if (denom.isZero()) {
+        liquidationPrice = entryPrice;
+      } else {
+        const mmrOtherVal = position.mmrOther || new Decimal(0);
+        // p' = (e - s * p - MMR_other) / (abs(s) * MMF - s)
+        liquidationPrice = position.equity.sub(s.mul(entryPrice)).sub(mmrOtherVal).div(denom);
+      }
+
+      this.logger.log(
+        `[calculateLiquidationPrice] Using dYdX Real-Time Equity: ${position.equity.toFixed(4)}, ` +
+        `Side: ${side}, Size: ${size}, Entry: ${entryPrice}, Oracle: ${oraclePrice}, ` +
+        `MMR Other: ${(position.mmrOther || new Decimal(0)).toFixed(4)}, ` +
+        `Calculated Liq Price: ${liquidationPrice.toFixed(4)}`
+      );
     } else {
-      liquidationPrice = entryPrice.add(quotient);
+      /**
+       * Fallback Formula (using only Margin):
+       *
+       *   MarginDiff = Margin - MMR_current
+       *   Quotient = MarginDiff / Size
+       *
+       *   For LONG:  LiqPrice = EntryPrice - (Margin - MMR) / Size
+       *   For SHORT: LiqPrice = EntryPrice + (Margin - MMR) / Size
+       */
+      const unrealizedPnl = side === 'LONG'
+        ? size.mul(oraclePrice.sub(entryPrice))
+        : size.mul(entryPrice.sub(oraclePrice));
+      const calcEquity = margin.add(unrealizedPnl);
+
+      this.logger.log(
+        `[calculateLiquidationPrice] Fallback to Margin: ${margin}, Side: ${side}, Size: ${size}, Entry: ${entryPrice}, Oracle: ${oraclePrice}, ` +
+        `Unrealized P&L: ${unrealizedPnl.toFixed(4)}, Calc Equity: ${calcEquity.toFixed(4)}, MMR: ${mmr.toFixed(4)}`
+      );
+
+      const marginDiff = margin.sub(mmr);
+      const quotient = marginDiff.div(size);
+
+      if (side === 'LONG') {
+        liquidationPrice = entryPrice.sub(quotient);
+      } else {
+        liquidationPrice = entryPrice.add(quotient);
+      }
     }
 
     if (liquidationPrice.isNegative()) {
